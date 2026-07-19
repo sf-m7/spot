@@ -1,25 +1,29 @@
-"""GATE ZERO: can we reach Etimad at all, from the machine that will do the scraping?
+"""Etimad access probe - standalone, no imports from other project files.
 
-Every downstream assumption in the concept documents rests on Etimad being
-"openly accessible, no auth, no rate limiting". As of 2026-07-19 a request from
-a datacentre IP is answered by an F5 bot-defence challenge page instead of data.
-That may or may not apply to GitHub Actions runners - this probe measures it
-rather than assuming either way.
+Answers one question: can a free GitHub Actions machine read Etimad, or does a
+bot-defence wall stand in the way?
 
-Run it, read the table it prints, and only then decide whether the scraper is a
-weekend of parsing or a proxy-budget problem.
+Run:  python probe_etimad.py
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
+from datetime import datetime, timezone
 
 import httpx
 
-from . import config, db
+SUPABASE_URL = os.environ.get("SPOT_SUPABASE_URL") or "https://wlnjdhgighoudrzoddyq.supabase.co"
+SUPABASE_KEY = os.environ.get("SPOT_SUPABASE_SERVICE_KEY") or ""
 
-# Candidate surfaces, cheapest/most valuable first. If a path 404s that is
-# itself a finding (Etimad moved), and distinct from being blocked.
+DELAY_SECONDS = 3.0
+TIMEOUT_SECONDS = 30
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
 CANDIDATES: list[tuple[str, str]] = [
     ("root", "https://tenders.etimad.sa/"),
     ("list_html", "https://tenders.etimad.sa/Tender/AllTendersForVisitor"),
@@ -28,7 +32,6 @@ CANDIDATES: list[tuple[str, str]] = [
     ("awards_html", "https://tenders.etimad.sa/Tender/AllAwardedTendersForVisitor"),
 ]
 
-# Fingerprints of the F5 / BIG-IP ASM interstitial rather than real content.
 BLOCK_MARKERS = (
     "support id",
     "this question is for testing whether you are a human",
@@ -41,62 +44,90 @@ BLOCK_MARKERS = (
 def classify(resp: httpx.Response) -> str:
     body = resp.text[:20000].lower()
     if any(m in body for m in BLOCK_MARKERS):
-        return "BLOCKED_BOT_DEFENCE"
+        return "BLOCKED"
     if resp.status_code == 404:
         return "NOT_FOUND"
     if resp.status_code >= 500:
         return "SERVER_ERROR"
     if resp.status_code != 200:
         return f"HTTP_{resp.status_code}"
-    ctype = resp.headers.get("content-type", "")
-    if "json" in ctype:
+    if "json" in resp.headers.get("content-type", ""):
         return "OK_JSON"
     if len(resp.text) < 2000:
         return "OK_BUT_TINY"
     return "OK_HTML"
 
 
+def log_to_supabase(lines: list[str], reachable: bool) -> None:
+    """Best effort. A logging failure must never hide the probe result."""
+    if not SUPABASE_KEY:
+        print("\n(no database key set - results printed only, not saved)")
+        return
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        httpx.post(
+            f"{SUPABASE_URL}/rest/v1/scrape_run",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            json={
+                "job": "probe_etimad",
+                "finished_at": now,
+                "status": "ok" if reachable else "empty",
+                "rows_seen": len(lines),
+                "notes": "\n".join(lines),
+            },
+            timeout=TIMEOUT_SECONDS,
+        ).raise_for_status()
+        print("\n(results saved to the database)")
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n(could not save to database: {type(exc).__name__}: {exc})")
+
+
 def main() -> int:
     headers = {
-        "User-Agent": config.USER_AGENT,
+        "User-Agent": USER_AGENT,
         "Accept-Language": "ar,en;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
     }
-    results = []
-    with db.run("probe_etimad") as r:
-        with httpx.Client(
-            headers=headers,
-            timeout=config.REQUEST_TIMEOUT_SECONDS,
-            follow_redirects=True,
-        ) as http:
-            for name, url in CANDIDATES:
-                try:
-                    resp = http.get(url)
-                    verdict = classify(resp)
-                    detail = (
-                        f"{resp.status_code} "
-                        f"{resp.headers.get('content-type', '?').split(';')[0]} "
-                        f"{len(resp.content)}B"
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    verdict, detail = "TRANSPORT_ERROR", f"{type(exc).__name__}: {exc}"
+    lines: list[str] = []
 
-                results.append((name, verdict, detail))
-                r.rows_seen += 1
-                r.note(f"{name:<15} {verdict:<20} {detail}")
-                time.sleep(config.REQUEST_DELAY_SECONDS)
+    with httpx.Client(headers=headers, timeout=TIMEOUT_SECONDS, follow_redirects=True) as http:
+        for name, url in CANDIDATES:
+            try:
+                resp = http.get(url)
+                verdict = classify(resp)
+                detail = (
+                    f"{resp.status_code} "
+                    f"{resp.headers.get('content-type', '?').split(';')[0]} "
+                    f"{len(resp.content)} bytes"
+                )
+            except Exception as exc:  # noqa: BLE001
+                verdict, detail = "CONNECT_FAILED", f"{type(exc).__name__}: {exc}"
 
-        reachable = [n for n, v, _ in results if v.startswith("OK")]
-        if reachable:
-            r.note(f"REACHABLE: {', '.join(reachable)} -> build the parser next.")
-        else:
-            r.note("NO SURFACE REACHABLE -> the 'no proxy costs' assumption is dead. "
-                   "Decide: residential proxies (a real monthly cost) or stop.")
+            line = f"{name:<15} {verdict:<15} {detail}"
+            lines.append(line)
+            print(line, flush=True)
+            time.sleep(DELAY_SECONDS)
 
-    print("\n=== Etimad access probe ===")
-    for name, verdict, detail in results:
-        print(f"{name:<15} {verdict:<20} {detail}")
-    return 0 if any(v.startswith("OK") for _, v, _ in results) else 1
+    reachable = [ln.split()[0] for ln in lines if " OK" in ln]
+
+    print("\n" + "=" * 60)
+    if reachable:
+        print("RESULT: WE CAN READ ETIMAD from this machine.")
+        print("Working entry points: " + ", ".join(reachable))
+        print("Next step: build the real scraper. No proxy cost.")
+    else:
+        print("RESULT: BLOCKED. Etimad refused every entry point.")
+        print("The 'Spot runs for free' assumption does not hold.")
+        print("Next step: decide whether to pay for proxies, or stop.")
+    print("=" * 60)
+
+    log_to_supabase(lines, bool(reachable))
+    return 0  # always green: the printed result is the answer, not the exit code
 
 
 if __name__ == "__main__":
