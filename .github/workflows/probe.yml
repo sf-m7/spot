@@ -1,8 +1,6 @@
 name: probe-etimad
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "17 4 * * *"   # daily, off the hour
 jobs:
   probe:
     runs-on: ubuntu-latest
@@ -11,8 +9,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r requirements.txt
-      - run: python -m spot.probe_etimad
+      - run: pip install httpx
+      - run: python probe_etimad.py
         env:
-          SPOT_SUPABASE_URL: ${{ secrets.SPOT_SUPABASE_URL }}
           SPOT_SUPABASE_SERVICE_KEY: ${{ secrets.SPOT_SUPABASE_SERVICE_KEY }}
