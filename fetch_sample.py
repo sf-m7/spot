@@ -1,38 +1,31 @@
-"""Step 3 (second attempt): get one real page of Etimad tender data.
+"""Step 3 (third attempt): read Etimad's own data call instead of inventing one.
 
-First attempt failed in a useful way: the browser earned 10 cookies, handed them
-to a plain script, and Etimad rejected it outright. The pass is bound to the
-browser itself, not just to the cookies. So the fetch must happen INSIDE the
-browser - which is exactly what Etimad's own page does.
+Attempt 2 failed because I altered the request (PageSize=24, dropped the
+cache-buster) and Etimad's firewall rejected the unfamiliar shape - a different
+refusal from the human-check page.
 
-This step only LOOKS. It stores nothing. Its job is to reveal what fields
-Etimad actually gives us per tender.
+So: load the page, let it make its normal call, and read the reply as it
+arrives. That call is already known to succeed. Then, separately, test how far
+the request can be bent - which decides whether bulk collection is possible or
+whether we are stuck at six tenders a click.
 
-Run:
-  pip install playwright
-  playwright install --with-deps chromium
-  python fetch_sample.py
+Stores nothing. Looking only.
 """
 from __future__ import annotations
 
 import json
+import re
 import sys
 
 from playwright.sync_api import sync_playwright
 
 GATE_PAGE = "https://tenders.etimad.sa/Tender/AllTendersForVisitor"
-# Exactly the shape the page itself used, only asking for more per page.
-DATA_PATH = (
-    "/Tender/AllSupplierTendersForVisitorAsync"
-    "?PageSize=24&PublishDateId=5&pageNumber=1"
-)
+TARGET = "AllSupplierTendersForVisitorAsync"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
-# JavaScript run inside the loaded page, so the request carries the page's own
-# identity - same connection, same cookies, same fingerprint.
 IN_PAGE_FETCH = """
 async (path) => {
   const r = await fetch(path, {
@@ -40,9 +33,12 @@ async (path) => {
                'Accept': 'application/json, text/javascript, */*; q=0.01' },
     credentials: 'include'
   });
+  const body = await r.text();
   return { status: r.status,
            contentType: r.headers.get('content-type') || '',
-           body: await r.text() };
+           rejected: body.includes('Request Rejected'),
+           length: body.length,
+           body: body.slice(0, 400000) };
 }
 """
 
@@ -70,16 +66,42 @@ def find_records(data):
         return data
     if isinstance(data, dict):
         for key in ("data", "items", "tenders", "result", "Data", "Items"):
-            if isinstance(data.get(key), list) and data[key]:
-                return data[key]
-        # fall back to the first non-empty list of dicts anywhere on top level
+            v = data.get(key)
+            if isinstance(v, list) and v:
+                return v
         for v in data.values():
             if isinstance(v, list) and v and isinstance(v[0], dict):
                 return v
     return None
 
 
+def report(label: str, body: str) -> None:
+    print(f"\n{'=' * 60}\n{label}\n{'=' * 60}")
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        print("Not JSON - looks like HTML markup. First 1200 characters:\n")
+        print(body[:1200])
+        return
+
+    print("--- SHAPE ---")
+    for line in describe(data):
+        print(line)
+
+    records = find_records(data)
+    if records and isinstance(records[0], dict):
+        print(f"\n--- FIELD NAMES ({len(records)} records on this page) ---")
+        for k in sorted(records[0].keys()):
+            print(f"  {k}")
+        print("\n--- ONE FULL RECORD ---")
+        print(json.dumps(records[0], ensure_ascii=False, indent=2)[:4000])
+    else:
+        print("\n(no obvious record list - see shape above)")
+
+
 def main() -> int:
+    captured: list[tuple[str, str]] = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])
         ctx = browser.new_context(
@@ -87,43 +109,66 @@ def main() -> int:
         )
         page = ctx.new_page()
 
-        page.goto(GATE_PAGE, wait_until="domcontentloaded", timeout=90_000)
-        page.wait_for_timeout(12_000)  # let the challenge clear
-        print(f"gate page title: {page.title()!r}")
+        def on_response(resp):
+            if TARGET in resp.url:
+                try:
+                    captured.append((resp.url, resp.text()))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"(could not read body of {resp.url}: {exc})")
 
-        res = page.evaluate(IN_PAGE_FETCH, DATA_PATH)
+        page.on("response", on_response)
+
+        page.goto(GATE_PAGE, wait_until="domcontentloaded", timeout=90_000)
+        page.wait_for_timeout(15_000)
+        print(f"gate page title: {page.title()!r}")
+        print(f"captured {len(captured)} data replies from the page's own request")
+
+        # --- pagination probe: bend the page's own URL, one change at a time ---
+        variants: list[tuple[str, str]] = []
+        if captured:
+            base = captured[0][0].split("tenders.etimad.sa")[-1]
+            print(f"\nbase request the page used:\n  {base}")
+            variants = [
+                ("same URL again", base),
+                ("page 2", re.sub(r"pageNumber=\d+", "pageNumber=2", base)),
+                ("50 per page", re.sub(r"PageSize=\d+", "PageSize=50", base)),
+                ("no date filter", re.sub(r"&?PublishDateId=\d+", "", base)),
+            ]
+
+        probe_results = []
+        for label, url in variants:
+            try:
+                res = page.evaluate(IN_PAGE_FETCH, url)
+                verdict = (
+                    "REJECTED" if res["rejected"]
+                    else f"OK {res['status']} {res['contentType'].split(';')[0]} {res['length']} chars"
+                )
+            except Exception as exc:  # noqa: BLE001
+                verdict, res = f"ERROR {type(exc).__name__}", None
+            probe_results.append((label, verdict, res))
+            page.wait_for_timeout(3000)
+
         browser.close()
 
-    print(f"\ndata request: {res['status']} {res['contentType']} {len(res['body'])} chars")
-
-    body = res["body"]
-    if "Request Rejected" in body or "support ID" in body:
-        print("\nStill rejected even from inside the page. First 500 characters:")
-        print(body[:500])
-        return 0
-
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError:
-        print("\nNot JSON. This is probably an HTML fragment for the table.")
-        print("First 1500 characters so we can see its structure:\n")
-        print(body[:1500])
-        return 0
-
-    print("\n--- SHAPE OF THE RESPONSE ---")
-    for line in describe(data):
-        print(line)
-
-    records = find_records(data)
-    if records:
-        print(f"\n--- ONE FULL RECORD (of {len(records)} on this page) ---")
-        print(json.dumps(records[0], ensure_ascii=False, indent=2)[:4000])
-        print("\n--- FIELD NAMES ---")
-        if isinstance(records[0], dict):
-            for k in sorted(records[0].keys()):
-                print(k)
+    if captured:
+        report("THE PAGE'S OWN DATA (this is what we can definitely read)", captured[0][1])
     else:
-        print("\n(could not spot the list of tenders - see the shape above)")
+        print("\nNo data reply captured. The page may render its table server-side.")
+
+    print(f"\n{'=' * 60}\nHOW FAR THE REQUEST CAN BE BENT\n{'=' * 60}")
+    for label, verdict, _ in probe_results:
+        print(f"{label:<18} {verdict}")
+
+    ok_bends = [lbl for lbl, v, _ in probe_results if v.startswith("OK")]
+    print()
+    if any(lbl in ("page 2", "50 per page", "no date filter") for lbl in ok_bends):
+        print("Bulk collection is possible - we can walk through pages.")
+    elif "same URL again" in ok_bends:
+        print("We can repeat the exact call but not change it.")
+        print("Bulk collection would mean clicking through pages like a person.")
+    else:
+        print("Even repeating the page's own call is refused.")
+        print("Only what the page loads by itself is readable.")
 
     return 0
 
